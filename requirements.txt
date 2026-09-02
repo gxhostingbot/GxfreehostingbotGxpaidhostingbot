@@ -1,6 +1,5 @@
 pyTelegramBotAPI
-Flask
-requests
-psutil
 pymongo
 dnspython
+flask
+psutil
