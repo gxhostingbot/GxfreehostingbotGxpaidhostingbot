@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -19,6 +18,8 @@ import zipfile
 from flask import Flask
 from threading import Thread
 import psutil
+from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 import telebot
 from telebot import types
 
@@ -50,12 +51,21 @@ def keep_alive():
 
 # --- Configuration ---
 # Keep credentials in Render environment variables, never in source control.
-TOKEN ="8873320592:AAEA46mnkJ-UR2g-KJak9hqfj0lor10Glng"
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError(
         "Missing TELEGRAM_BOT_TOKEN environment variable. "
         "Set it in Render before starting the bot."
     )
+
+MONGO_URI = os.environ.get("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError(
+        "Missing MONGO_URI environment variable. "
+        "Set it to your MongoDB Atlas connection string in Render."
+    )
+
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "telegram_hosting_bot")
 
 
 def required_int_env(name, fallback=None):
@@ -79,8 +89,6 @@ BINANCE_PAY_ID = os.environ.get("BINANCE_PAY_ID", "SET_YOUR_BINANCE_PAY_ID")
 # Folder setup - using absolute paths
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, "upload_bots")
-IROTECH_DIR = os.path.join(BASE_DIR, "inf")
-DATABASE_PATH = os.path.join(IROTECH_DIR, "bot_data.db")
 
 # File upload limits
 FREE_USER_LIMIT = 0  # Default free limit
@@ -90,7 +98,6 @@ OWNER_LIMIT = float("inf")
 
 # Create necessary directories
 os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
-os.makedirs(IROTECH_DIR, exist_ok=True)
 
 # Initialize bot
 bot = telebot.TeleBot(TOKEN)
@@ -162,107 +169,139 @@ ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["👑 𝗖𝗼𝗻𝘁𝗮𝗰𝘁 𝗢𝘄𝗻𝗲𝗿"],
 ]
 
-# --- Database Setup ---
+# --- MongoDB Atlas Setup ---
 DB_LOCK = threading.Lock()
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+mongo_db = mongo_client[MONGO_DB_NAME]
+
+subscriptions_collection = mongo_db["subscriptions"]
+user_files_collection = mongo_db["user_files"]
+active_users_collection = mongo_db["active_users"]
+admins_collection = mongo_db["admins"]
+plans_collection = mongo_db["plans"]
+payment_requests_collection = mongo_db["payment_requests"]
+counters_collection = mongo_db["counters"]
+
+
+def _next_sequence(sequence_name):
+    """Return the next integer ID for a MongoDB-backed legacy-style ID."""
+    counter = counters_collection.find_one_and_update(
+        {"_id": sequence_name},
+        {"$inc": {"value": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return counter["value"]
+
+
+def _coerce_datetime(value):
+    """Read both BSON datetimes and ISO strings left by older deployments."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def init_db():
-    """Initialize the database with required tables"""
-    logger.info(f"Initializing database at: {DATABASE_PATH}")
+    """Initialize MongoDB collections, indexes, and required admin records."""
+    logger.info("Initializing MongoDB database: %s", MONGO_DB_NAME)
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS subscriptions
-                     (user_id INTEGER PRIMARY KEY, plan_name TEXT, expiry TEXT)"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS user_files
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
-                      PRIMARY KEY (user_id, file_name))"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS active_users
-                     (user_id INTEGER PRIMARY KEY)"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS admins
-                     (user_id INTEGER PRIMARY KEY)"""
-        )
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS plans
-                     (plan_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, file_limit INTEGER, price TEXT, duration INTEGER, buy_link TEXT)"""
-        )
+        mongo_client.admin.command("ping")
 
-        c.execute(
-            """CREATE TABLE IF NOT EXISTS payment_requests
-                     (request_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      user_id INTEGER NOT NULL,
-                      plan_id INTEGER NOT NULL,
-                      tx_id TEXT NOT NULL UNIQUE,
-                      status TEXT NOT NULL DEFAULT 'pending',
-                      submitted_at TEXT NOT NULL,
-                      reviewed_at TEXT,
-                      reviewer_id INTEGER)"""
+        subscriptions_collection.create_index(
+            [("user_id", ASCENDING)], unique=True
         )
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_payment_requests_status "
-            "ON payment_requests(status)"
+        user_files_collection.create_index(
+            [("user_id", ASCENDING), ("file_name", ASCENDING)], unique=True
         )
+        active_users_collection.create_index([("user_id", ASCENDING)], unique=True)
+        admins_collection.create_index([("user_id", ASCENDING)], unique=True)
+        plans_collection.create_index([("plan_id", ASCENDING)], unique=True)
+        payment_requests_collection.create_index(
+            [("request_id", ASCENDING)], unique=True
+        )
+        payment_requests_collection.create_index([("tx_id", ASCENDING)], unique=True)
+        payment_requests_collection.create_index([("status", ASCENDING)])
 
-        c.execute(
-            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,)
+        # Keep generated callback IDs ahead of any records already in Atlas.
+        latest_plan = plans_collection.find_one(
+            sort=[("plan_id", -1)], projection={"plan_id": 1}
         )
-        if ADMIN_ID != OWNER_ID:
-            c.execute(
-                "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (ADMIN_ID,)
+        if latest_plan:
+            counters_collection.update_one(
+                {"_id": "plans"},
+                {"$max": {"value": latest_plan["plan_id"]}},
+                upsert=True,
+            )
+        latest_request = payment_requests_collection.find_one(
+            sort=[("request_id", -1)], projection={"request_id": 1}
+        )
+        if latest_request:
+            counters_collection.update_one(
+                {"_id": "payment_requests"},
+                {"$max": {"value": latest_request["request_id"]}},
+                upsert=True,
             )
 
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully.")
+        admins_collection.update_one(
+            {"user_id": OWNER_ID}, {"$set": {"user_id": OWNER_ID}}, upsert=True
+        )
+        if ADMIN_ID != OWNER_ID:
+            admins_collection.update_one(
+                {"user_id": ADMIN_ID}, {"$set": {"user_id": ADMIN_ID}}, upsert=True
+            )
+
+        logger.info("MongoDB initialized successfully.")
     except Exception as e:
-        logger.error(f"❌ Database initialization error: {e}", exc_info=True)
+        logger.error("❌ MongoDB initialization error: %s", e, exc_info=True)
+        raise RuntimeError("Could not connect to MongoDB Atlas.") from e
 
 
 def load_data():
-    """Load data from database into memory"""
-    logger.info("Loading data from database...")
+    """Load MongoDB data into the in-memory structures used by the handlers."""
+    logger.info("Loading data from MongoDB...")
     try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-
-        c.execute("SELECT user_id, plan_name, expiry FROM subscriptions")
-        for row in c.fetchall():
-            user_id = row[0]
-            plan_name = row[1] if len(row) > 2 else "Premium"
-            expiry = row[-1]
-            try:
-                user_subscriptions[user_id] = {
-                    "plan_name": plan_name,
-                    "expiry": datetime.fromisoformat(expiry),
-                }
-            except ValueError:
+        for document in subscriptions_collection.find(
+            {}, {"_id": 0, "user_id": 1, "plan_name": 1, "expiry": 1}
+        ):
+            expiry = _coerce_datetime(document.get("expiry"))
+            if expiry is None:
                 logger.warning(
-                    f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping."
+                    "⚠️ Invalid expiry date format for user %s: %s. Skipping.",
+                    document.get("user_id"),
+                    document.get("expiry"),
                 )
+                continue
+            user_subscriptions[document["user_id"]] = {
+                "plan_name": document.get("plan_name", "Premium"),
+                "expiry": expiry,
+            }
 
-        c.execute("SELECT user_id, file_name, file_type FROM user_files")
-        for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
+        for document in user_files_collection.find(
+            {}, {"_id": 0, "user_id": 1, "file_name": 1, "file_type": 1}
+        ):
+            user_files.setdefault(document["user_id"], []).append(
+                (document["file_name"], document.get("file_type", "py"))
+            )
 
-        c.execute("SELECT user_id FROM active_users")
-        active_users.update(user_id for (user_id,) in c.fetchall())
-
-        c.execute("SELECT user_id FROM admins")
-        admin_ids.update(user_id for (user_id,) in c.fetchall())
-
-        conn.close()
-        logger.info(f"Data loaded successfully.")
+        active_users.update(
+            document["user_id"] for document in active_users_collection.find(
+                {}, {"_id": 0, "user_id": 1}
+            )
+        )
+        admin_ids.update(
+            document["user_id"] for document in admins_collection.find(
+                {}, {"_id": 0, "user_id": 1}
+            )
+        )
+        logger.info("Data loaded successfully from MongoDB.")
     except Exception as e:
-        logger.error(f"❌ Error loading data: {e}", exc_info=True)
+        logger.error("❌ Error loading data from MongoDB: %s", e, exc_info=True)
+        raise
 
 
 init_db()
@@ -295,134 +334,112 @@ def parse_price_to_usdt(price_str):
 # --- Database Helper Operations ---
 def add_plan_db(name, file_limit, price, duration, buy_link):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO plans (name, file_limit, price, duration, buy_link) VALUES (?, ?, ?, ?, ?)",
-            (name, file_limit, price, duration, buy_link),
+        plan_id = _next_sequence("plans")
+        plans_collection.insert_one(
+            {
+                "plan_id": plan_id,
+                "name": name,
+                "file_limit": file_limit,
+                "price": price,
+                "duration": duration,
+                "buy_link": buy_link,
+            }
         )
-        conn.commit()
-        conn.close()
 
 
 def get_all_plans():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute(
-        "SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans"
-    )
-    plans = c.fetchall()
-    conn.close()
-    return plans
+    return [
+        (
+            document["plan_id"],
+            document["name"],
+            document["file_limit"],
+            document["price"],
+            document["duration"],
+            document.get("buy_link", ""),
+        )
+        for document in plans_collection.find().sort("plan_id", ASCENDING)
+    ]
 
 
 def get_plan_by_id(plan_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    c = conn.cursor()
-    c.execute(
-        "SELECT plan_id, name, file_limit, price, duration, buy_link FROM plans WHERE plan_id = ?",
-        (plan_id,),
+    document = plans_collection.find_one({"plan_id": plan_id})
+    if not document:
+        return None
+    return (
+        document["plan_id"],
+        document["name"],
+        document["file_limit"],
+        document["price"],
+        document["duration"],
+        document.get("buy_link", ""),
     )
-    plan = c.fetchone()
-    conn.close()
-    return plan
 
 
 def delete_plan_db(plan_id):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM plans WHERE plan_id = ?", (plan_id,))
-        conn.commit()
-        conn.close()
+        plans_collection.delete_one({"plan_id": plan_id})
 
 
 # --- Manual Payment Review Helpers ---
 def create_payment_request(user_id, plan_id, tx_id):
     """Store a payment claim as pending and return its request ID."""
-    submitted_at = datetime.now().isoformat(timespec="seconds")
+    submitted_at = datetime.now()
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
         try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO payment_requests
-                   (user_id, plan_id, tx_id, status, submitted_at)
-                   VALUES (?, ?, ?, 'pending', ?)""",
-                (user_id, plan_id, tx_id, submitted_at),
+            request_id = _next_sequence("payment_requests")
+            payment_requests_collection.insert_one(
+                {
+                    "request_id": request_id,
+                    "user_id": user_id,
+                    "plan_id": plan_id,
+                    "tx_id": tx_id,
+                    "status": "pending",
+                    "submitted_at": submitted_at,
+                }
             )
-            conn.commit()
-            return cursor.lastrowid
-        except sqlite3.IntegrityError:
-            conn.rollback()
+            return request_id
+        except DuplicateKeyError:
             return None
-        finally:
-            conn.close()
 
 
 def get_payment_request(request_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """SELECT request_id, user_id, plan_id, tx_id, status,
-                      submitted_at, reviewed_at, reviewer_id
-               FROM payment_requests WHERE request_id = ?""",
-            (request_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return None
-        keys = (
-            "request_id",
-            "user_id",
-            "plan_id",
-            "tx_id",
-            "status",
-            "submitted_at",
-            "reviewed_at",
-            "reviewer_id",
-        )
-        return dict(zip(keys, row))
-    finally:
-        conn.close()
+    return payment_requests_collection.find_one(
+        {"request_id": request_id},
+        {
+            "_id": 0,
+            "request_id": 1,
+            "user_id": 1,
+            "plan_id": 1,
+            "tx_id": 1,
+            "status": 1,
+            "submitted_at": 1,
+            "reviewed_at": 1,
+            "reviewer_id": 1,
+        },
+    )
 
 
 def get_payment_request_by_txid(tx_id):
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT request_id, status FROM payment_requests WHERE tx_id = ?",
-            (tx_id,),
-        )
-        row = cursor.fetchone()
-        return {"request_id": row[0], "status": row[1]} if row else None
-    finally:
-        conn.close()
+    return payment_requests_collection.find_one(
+        {"tx_id": tx_id},
+        {"_id": 0, "request_id": 1, "status": 1},
+    )
 
 
 def mark_payment_request(request_id, status, reviewer_id):
     """Transition a pending request once; returns whether this call won."""
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                """UPDATE payment_requests
-                   SET status = ?, reviewed_at = ?, reviewer_id = ?
-                   WHERE request_id = ? AND status = 'pending'""",
-                (
-                    status,
-                    datetime.now().isoformat(timespec="seconds"),
-                    reviewer_id,
-                    request_id,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount == 1
-        finally:
-            conn.close()
+        result = payment_requests_collection.update_one(
+            {"request_id": request_id, "status": "pending"},
+            {
+                "$set": {
+                    "status": status,
+                    "reviewed_at": datetime.now(),
+                    "reviewer_id": reviewer_id,
+                }
+            },
+        )
+        return result.matched_count == 1
 
 
 # --- Malware Detection Functions ---
@@ -776,14 +793,11 @@ def run_js_script(
 # --- Database Operations ---
 def save_user_file(user_id, file_name, file_type="py"):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)",
-            (user_id, file_name, file_type),
+        user_files_collection.update_one(
+            {"user_id": user_id, "file_name": file_name},
+            {"$set": {"user_id": user_id, "file_name": file_name, "file_type": file_type}},
+            upsert=True,
         )
-        conn.commit()
-        conn.close()
         if user_id not in user_files:
             user_files[user_id] = []
         user_files[user_id] = [
@@ -794,14 +808,9 @@ def save_user_file(user_id, file_name, file_type="py"):
 
 def remove_user_file_db(user_id, file_name):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            "DELETE FROM user_files WHERE user_id = ? AND file_name = ?",
-            (user_id, file_name),
+        user_files_collection.delete_one(
+            {"user_id": user_id, "file_name": file_name}
         )
-        conn.commit()
-        conn.close()
         if user_id in user_files:
             user_files[user_id] = [
                 f for f in user_files[user_id] if f[0] != file_name
@@ -811,35 +820,32 @@ def remove_user_file_db(user_id, file_name):
 def add_active_user(user_id):
     active_users.add(user_id)
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR IGNORE INTO active_users (user_id) VALUES (?)", (user_id,)
+        active_users_collection.update_one(
+            {"user_id": user_id},
+            {"$set": {"user_id": user_id}},
+            upsert=True,
         )
-        conn.commit()
-        conn.close()
 
 
 def save_subscription(user_id, plan_name, expiry):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO subscriptions (user_id, plan_name, expiry) VALUES (?, ?, ?)",
-            (user_id, plan_name, expiry.isoformat()),
+        subscriptions_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "plan_name": plan_name,
+                    "expiry": expiry,
+                }
+            },
+            upsert=True,
         )
-        conn.commit()
-        conn.close()
         user_subscriptions[user_id] = {"plan_name": plan_name, "expiry": expiry}
 
 
 def remove_subscription_db(user_id):
     with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
+        subscriptions_collection.delete_one({"user_id": user_id})
         if user_id in user_subscriptions:
             del user_subscriptions[user_id]
 
