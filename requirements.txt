@@ -1,5 +1,4 @@
-pyTelegramBotAPI
+requests
 pymongo
-dnspython
-flask
-psutil
+pyotp
+beautifulsoup4
